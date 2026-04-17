@@ -2,23 +2,16 @@
 setlocal enabledelayedexpansion
 
 :: ============================================================
-::  ForceDelete.bat
-::  ----------------------------------------------------------
-::  Drag any file or folder onto this batch file to delete it.
-::  Bypasses Recycle Bin. Designed to recover from malware that
-::  corrupted ACLs or ownership on your own files.
-::
-::  Layered strategy (does as much as your privileges allow):
-::    1) Strip read-only/hidden/system attributes, plain delete.
-::    2) If anything stubborn remains, relaunch elevated.
-::    3) Elevated pass: takeown + icacls (SID-based, language
-::       independent) + robocopy /MIR empty-dir trick for stuck
-::       folders and >260-char paths.
-::
-::  Honest limit: a true standard user with no admin password
-::  cannot pass UAC. Layer 1 still runs; layers 2-3 require
-::  clicking "Yes" or providing admin credentials.
+::  ForceDelete.bat  (v3)
+::  Drag files/folders onto this file -> permanent delete.
+::  No Recycle Bin. No confirmation. Window stays open.
+::  Writes ForceDelete.log next to itself.
 :: ============================================================
+
+set "LOG=%~dp0ForceDelete.log"
+>> "%LOG%" echo.
+>> "%LOG%" echo ====== %DATE% %TIME% ======
+>> "%LOG%" echo cmdline: %*
 
 :: Re-entry marker after self-elevation
 if /i "%~1"=="--forced" (
@@ -28,67 +21,117 @@ if /i "%~1"=="--forced" (
 
 if "%~1"=="" (
     echo.
-    echo  ForceDelete - drag files or folders onto this file.
-    echo  WARNING: deletion is PERMANENT (no Recycle Bin).
+    echo  ForceDelete - drag files/folders onto this file.
+    echo  Permanent. No Recycle Bin. No confirmation.
     echo.
     pause
     exit /b 1
 )
 
 echo.
-echo  Items to PERMANENTLY DELETE:
-echo  ----------------------------
-for %%I in (%*) do echo    %%~fI
-echo  ----------------------------
-choice /C YN /N /M "Proceed? [Y/N]: "
-if errorlevel 2 (
-    echo Cancelled.
-    timeout /t 1 >nul
-    exit /b 0
+echo  === ForceDelete v3 ===
+echo  User:      %USERDOMAIN%\%USERNAME%
+whoami /groups 2>nul | findstr /i "S-1-5-32-544" >nul
+if errorlevel 1 (
+    echo  Privilege: STANDARD USER  ^(items needing admin will fail^)
+    set "AM_ADMIN=0"
+) else (
+    echo  Privilege: ADMINISTRATOR
+    set "AM_ADMIN=1"
 )
-
-:: --- LAYER 1: try plain delete (no admin needed) ---
-set "STUBBORN="
-for %%I in (%*) do (
-    call :SoftDelete "%%~fI"
-    if exist "%%~fI" set STUBBORN=!STUBBORN! "%%~fI"
-)
-
-if not defined STUBBORN (
-    echo.
-    echo All items deleted.
-    timeout /t 2 >nul
-    exit /b 0
-)
-
-:: --- LAYER 2: relaunch elevated for the stubborn ones ---
+echo  Log:       %LOG%
 echo.
-echo Some items resisted. Requesting administrator rights...
-powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '--forced %STUBBORN%' -Verb RunAs"
+
+:: --- Process args via shift loop (correct quoting for paths with spaces) ---
+set "STUBBORN_COUNT=0"
+set "STUBBORN_LIST="
+
+:ArgLoop
+if "%~1"=="" goto :ArgDone
+call :SoftDelete "%~1"
+if exist "%~1" (
+    set /a STUBBORN_COUNT+=1
+    set STUBBORN_LIST=!STUBBORN_LIST! "%~1"
+)
+shift
+goto :ArgLoop
+:ArgDone
+
+if %STUBBORN_COUNT%==0 (
+    echo.
+    echo  All items deleted.
+    >> "%LOG%" echo result: all deleted
+    pause
+    exit /b 0
+)
+
+echo.
+echo  %STUBBORN_COUNT% item^(s^) resisted plain delete.
+
+if "%AM_ADMIN%"=="0" (
+    echo.
+    echo  You are a STANDARD USER. Items owned by SYSTEM, TrustedInstaller,
+    echo  or another user account cannot be deleted from this account
+    echo  without an administrator password. No script can bypass this.
+    echo.
+    echo  Trying elevation anyway in case UAC accepts a Yes click...
+)
+
+powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '--forced %STUBBORN_LIST%' -Verb RunAs" 2>>"%LOG%"
+if errorlevel 1 (
+    echo.
+    echo  Elevation denied or failed. Stubborn items remain.
+    >> "%LOG%" echo result: elevation denied
+    pause
+)
 exit /b 0
 
 
 :ElevatedRun
-:: Now running with admin rights (layer 3)
 echo.
-echo Running with administrator rights.
-for %%I in (%*) do call :HardDelete "%%~fI"
+echo  === Elevated pass ===
+:ElevLoop
+if "%~1"=="" goto :ElevDone
+call :HardDelete "%~1"
+shift
+goto :ElevLoop
+:ElevDone
 echo.
-echo Done.
+echo  Done.
 pause
 exit /b 0
 
 
-:: ----- Subroutines -----
+:: ============================================================
+:: Subroutines
+:: ============================================================
 
 :SoftDelete
 set "T=%~1"
-if not exist "%T%" exit /b 0
+echo.
+echo  Trying: %T%
+>> "%LOG%" echo trying: %T%
+
+if not exist "%T%" (
+    echo   [SKIP] not found
+    >> "%LOG%" echo   skip-not-found
+    exit /b 0
+)
+
 attrib -r -h -s "%T%" /s /d 2>nul
+
 if exist "%T%\" (
-    rmdir /s /q "%T%" 2>nul
+    rmdir /s /q "%T%" 2>>"%LOG%"
 ) else (
-    del /f /q "%T%" 2>nul
+    del /f /q "%T%" 2>>"%LOG%"
+)
+
+if exist "%T%" (
+    echo   [STUCK] needs admin or has DENY ACE
+    >> "%LOG%" echo   stuck
+) else (
+    echo   [OK]
+    >> "%LOG%" echo   ok
 )
 exit /b 0
 
@@ -97,14 +140,38 @@ exit /b 0
 set "T=%~1"
 if not exist "%T%" exit /b 0
 echo.
-echo Forcing: %T%
+echo  Forcing: %T%
+>> "%LOG%" echo forcing: %T%
+
+:: Remove explicit DENY entries (DENY beats GRANT)
+icacls "%T%" /remove:d *S-1-1-0 /c /q >nul 2>&1
+icacls "%T%" /remove:d *S-1-5-32-545 /c /q >nul 2>&1
+icacls "%T%" /remove:d *S-1-5-32-544 /c /q >nul 2>&1
 
 if exist "%T%\" (
     takeown /f "%T%" /r /d y >nul 2>&1
-    icacls "%T%" /grant *S-1-5-32-544:F /t /c /q >nul 2>&1
-    icacls "%T%" /reset /t /c /q >nul 2>&1
-    attrib -r -h -s "%T%" /s /d 2>nul
-    rmdir /s /q "%T%" 2>nul
+) else (
+    takeown /f "%T%" >nul 2>&1
+)
+
+icacls "%T%" /reset /t /c /q >nul 2>&1
+icacls "%T%" /grant *S-1-5-32-544:F /t /c /q >nul 2>&1
+
+attrib -r -h -s "%T%" /s /d 2>nul
+
+if exist "%T%\" (
+    if exist "%T%\NTUSER.DAT" (
+        for /f "tokens=*" %%H in ('reg query HKU 2^>nul ^| findstr /v "DEFAULT \.DEFAULT S-1-5-18 S-1-5-19 S-1-5-20"') do (
+            reg unload "%%H" >nul 2>&1
+        )
+    )
+
+    powershell -NoProfile -Command ^
+        "Get-ChildItem -LiteralPath '%T%' -Recurse -Force -ErrorAction SilentlyContinue | Where-Object { $_.Attributes -band [IO.FileAttributes]::ReparsePoint } | ForEach-Object { try { if ($_.PSIsContainer) { [IO.Directory]::Delete($_.FullName, $false) } else { [IO.File]::Delete($_.FullName) } } catch {} }" 2>nul
+
+    powershell -NoProfile -Command "try { Remove-Item -LiteralPath '%T%' -Recurse -Force -ErrorAction Stop } catch { }" 2>nul
+    if exist "%T%" rmdir /s /q "%T%" 2>>"%LOG%"
+
     if exist "%T%" (
         set "EMPTY=%TEMP%\__fd_empty_%RANDOM%__"
         mkdir "!EMPTY!" 2>nul
@@ -113,15 +180,16 @@ if exist "%T%\" (
         rmdir /s /q "!EMPTY!" 2>nul
     )
 ) else (
-    takeown /f "%T%" >nul 2>&1
-    icacls "%T%" /grant *S-1-5-32-544:F /c /q >nul 2>&1
-    attrib -r -h -s "%T%" 2>nul
-    del /f /q "%T%" 2>nul
+    powershell -NoProfile -Command "try { Remove-Item -LiteralPath '%T%' -Force -ErrorAction Stop } catch { }" 2>nul
+    if exist "%T%" del /f /q "%T%" 2>>"%LOG%"
 )
 
 if exist "%T%" (
-    echo   [FAIL] Could not delete - may be locked, in use, or owned by TrustedInstaller.
+    echo   [FAIL] still here. Final ACL:
+    icacls "%T%" 2>&1
+    >> "%LOG%" echo   FAIL
 ) else (
-    echo   [OK] Deleted.
+    echo   [OK]
+    >> "%LOG%" echo   ok
 )
 exit /b 0
